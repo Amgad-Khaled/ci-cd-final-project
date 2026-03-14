@@ -1,52 +1,81 @@
----
-apiVersion: tekton.dev/v1beta1
-kind: Task
+apiVersion: tekton.dev/v1
+kind: Pipeline
 metadata:
-  name: cleanup
-spec:
-  description: This task will clean up a workspace by deleting all the files.
-  workspaces:
-    - name: source
-  steps:
-    - name: remove
-      image: alpine:3
-      env:
-        - name: WORKSPACE_SOURCE_PATH
-          value: $(workspaces.source.path)
-      workingDir: $(workspaces.source.path)
-      securityContext:
-        runAsNonRoot: false
-        runAsUser: 0
-      script: |
-        #!/usr/bin/env sh
-        set -eu
-        echo "Removing all files from ${WORKSPACE_SOURCE_PATH} ..."
-        if [ -d "${WORKSPACE_SOURCE_PATH}" ] ; then
-          rm -rf "${WORKSPACE_SOURCE_PATH:?}"/*
-          rm -rf "${WORKSPACE_SOURCE_PATH}"/.[!.]*
-          rm -rf "${WORKSPACE_SOURCE_PATH}"/..?*
-        fi
-
----
-apiVersion: tekton.dev/v1beta1
-kind: Task
-metadata:
-  name: nose
+  name: cd-pipeline
 spec:
   workspaces:
-    - name: source
+    - name: output
   params:
-    - name: args
-      description: Arguments to pass to nose
+    - name: app-name
       type: string
-      default: "-v"
-  steps:
-    - name: nosetests
-      image: python:3.9-slim
-      workingDir: $(workspaces.source.path)
-      script: |
-        #!/bin/bash
-        set -e
-        python -m pip install --upgrade pip wheel
-        pip install -r requirements.txt
-        nosetests $(params.args)
+      default: my-app
+    - name: build-image
+      type: string
+      default: my-app-image:latest
+  tasks:
+    - name: cleanup
+      taskRef:
+        name: cleanup
+      workspaces:
+        - name: source
+          workspace: output
+
+    - name: git-clone
+      runAfter:
+        - cleanup
+      taskRef:
+        name: git-clone
+      params:
+        - name: url
+          value: https://github.com/<your-username>/<your-repo>.git
+        - name: revision
+          value: main
+      workspaces:
+        - name: output
+          workspace: output
+
+    - name: lint
+      runAfter:
+        - git-clone
+      taskRef:
+        name: flake8
+      workspaces:
+        - name: source
+          workspace: output
+
+    - name: run-tests
+      runAfter:
+        - lint
+      taskRef:
+        name: nose
+      workspaces:
+        - name: source
+          workspace: output
+      params:
+        - name: args
+          value: "-v --with-spec --spec-color --with-coverage --cover-package=app"
+
+    - name: build
+      runAfter:
+        - run-tests
+      taskRef:
+        name: buildah
+      workspaces:
+        - name: source
+          workspace: output
+      params:
+        - name: IMAGE
+          value: $(params.build-image)
+
+    - name: deploy
+      runAfter:
+        - build
+      taskRef:
+        name: openshift-client
+      workspaces:
+        - name: source
+          workspace: output
+      params:
+        - name: SCRIPT
+          value: |
+            oc create deployment $(params.app-name) --image=$(params.build-image) --dry-run=client -o yaml | oc apply -f -
